@@ -22,6 +22,29 @@ Address_t *my_address;
 Address_t** network = NULL;
 uint32_t peer_count = 0;
 
+
+// 1: Setting up
+void get_signature(char* password, int password_len, char* salt, hashdata_t* hash) {
+    int combined_length = password_len + SALT_LEN;
+    char* combined_buffer = malloc(combined_length);
+
+    if (combined_buffer == NULL) {
+        perror("Failed to allocate memory for combined buffer");
+        exit(EXIT_FAILURE);
+    }
+
+    memcpy(combined_buffer, password, password_len);
+    memcpy(combined_buffer + password_len, salt, SALT_LEN);
+
+    get_data_sha(combined_buffer, hash, combined_length, SHA256_HASH_SIZE);
+
+    free(combined_buffer);
+}
+
+
+
+
+
 /*
  * Send a request message to another peer on the network. Unless this is 
  * specifically an 'inform' message as described in the assignment handout, a 
@@ -214,6 +237,7 @@ int main(int argc, char **argv)
     After determining our salt but before saving our address we should probably
     work out what our signature should be. 
     */
+   get_signature(password, strlen(password), user_salt, my_address->signature);
 
     // Start our record of the network by recording our own address. Make sure
     // any time we update this array we also update the peer_count.
