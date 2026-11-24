@@ -71,6 +71,11 @@ void send_response(int connfd, uint32_t status, char* body, uint32_t length) {
         compsys_helper_writen(connfd, body, length);
     }
 }
+// 11. Send an error response back to the client
+void send_error_response(int connfd, uint32_t status, const char *message) {
+    fprintf(stderr, "Error: %s\n", message);
+    send_response(connfd, status, (char *)message, strlen(message));
+}
 
 /*
  * Send a request message to another peer on the network. Unless this is 
@@ -110,6 +115,11 @@ void send_message(Address_t peer_address, int command,
     }
     
     compsys_helper_writen(peer_socket, msg_buf, REQUEST_HEADER_LEN+body_length);
+    if (command == COMMAND_INFORM) {
+        close(peer_socket);
+        return;
+    }
+    
 
     /*
     3: Handing the response to the register message
@@ -179,8 +189,16 @@ void send_message(Address_t peer_address, int command,
         close(peer_socket);
         return;
     }
+    
+    // Check the total hash.
+    if (memcmp(calculated_hash, reply_header.total_hash, SHA256_HASH_SIZE) != 0) {
+        fprintf(stderr, "Error: Total hash mismatch.\n");
+        close(peer_socket);
+        return;
+    }
 
     // Check if the reply body length is a multiple of the peer address length.
+    if (command == COMMAND_REGISTER) {
     if (reply_length % PEER_ADDR_LEN != 0) {
         fprintf(stderr, "Error: Reply body has an invalid peer list length. \n");
         close(peer_socket);
@@ -249,6 +267,27 @@ void send_message(Address_t peer_address, int command,
         pthread_mutex_unlock(&network_mutex);
 
         printf("Added peer: %s:%u\n", new_peer->ip, new_peer->port);
+
+    }
+}
+    else if (command == COMMAND_RETREIVE) { // Retrieve logic
+        FILE *file = fopen(request_body, "wb");
+        if (file == NULL) {
+            perror("fopen");
+            close(peer_socket);
+            return;
+        }
+        // Write the received file data to the file.    
+        size_t bytes_written = fwrite(reply_body, 1, reply_length, file);
+        
+        if (bytes_written != reply_length) {
+            fprintf(stderr, "Error writing file.\n");
+            fclose(file);
+            close(peer_socket);
+            return;
+        }
+
+    fclose(file);
     }
 
     close(peer_socket);
@@ -264,10 +303,10 @@ void send_message(Address_t peer_address, int command,
  * This request/retrieve interaction is then repeated forever.
  */ 
 void* client_thread()
-{
-    char peer_ip[IP_LEN];
+{ // asks for peer IP and port
+    char peer_ip[IP_LEN]; 
     fprintf(stdout, "Enter peer IP to connect to: ");
-    scanf("%16s", peer_ip);
+    scanf("%15s", peer_ip);
 
     // Clean up password string as otherwise some extra chars can sneak in.
     for (int i=strlen(peer_ip); i<IP_LEN; i++)
@@ -277,7 +316,7 @@ void* client_thread()
 
     char peer_port[PORT_STR_LEN];
     fprintf(stdout, "Enter peer port to connect to: ");
-    scanf("%16s", peer_port);
+    scanf("%7s", peer_port);
 
     // Clean up password string as otherwise some extra chars can sneak in.
     for (int i=strlen(peer_port); i<PORT_STR_LEN; i++)
@@ -296,11 +335,24 @@ void* client_thread()
     */
    send_message(peer_address, COMMAND_REGISTER, NULL, 0);
 
+   while (1) {
+       char file_path[256];
+       fprintf(stdout, "Enter file path to retrieve: ");
+        scanf("%255s", file_path);
+    // Get a random peer from the network with a mutex lock to ensure thread safety.
+    Address_t random_peer;
+    pthread_mutex_lock(&network_mutex);
+    int random_peer_index = rand() % peer_count;
+    random_peer = *network[random_peer_index];
+    pthread_mutex_unlock(&network_mutex);
+    send_message(random_peer, COMMAND_RETREIVE, file_path, strlen(file_path));
+    }
     // You should never see this printed in your finished implementation
     printf("Client thread done\n");
 
     return NULL;
 }
+
 
 /*
  * Handler for all server requests. This will call the relevent function based 
@@ -348,7 +400,7 @@ void* handle_server_request_thread(void *vargp)
     char *body = NULL;
 
     if (header.length > 0) {
-        body = malloc(header.length);
+        body = malloc(header.length + 1); // +1 for null terminator
 
         if (body == NULL) {
             perror("malloc");
@@ -364,16 +416,23 @@ void* handle_server_request_thread(void *vargp)
             close(connfd);
             return NULL;
         }
+        body[header.length] = '\0'; // Null-terminate the body
     }
 
     // 6: Handling Register Requests
     uint32_t status = STATUS_BAD_REQUEST;
+    Address_t new_peer; // Declare a new peer address
+    memset(&new_peer, 0, sizeof(Address_t)); // Initialize the new peer address
+
+    // Generate a reply containing the current network.
+    uint32_t reply_length = 0;
+    char *reply_body = NULL;
 
     // Check that the request is a register request.
     if (header.command == COMMAND_REGISTER) {
         // A register request should not have a body.
         if (header.length != 0) {
-            status = STATUS_MALFORMED;
+            status = STATUS_MALFORMED;            
         }
 
         // Validate the IP address and port.
@@ -385,14 +444,10 @@ void* handle_server_request_thread(void *vargp)
                 status = STATUS_MALFORMED;
         }
         else {
-            // Create a temporary address for the peer.
-            Address_t new_peer;
-            memset(&new_peer, 0, sizeof(Address_t));
-
             memcpy(new_peer.ip, header.ip, IP_LEN);
             new_peer.port = header.port;
-            
-            // Check wether this peer is already registered.
+
+            // Check whether this peer is already registered.
             pthread_mutex_lock(&network_mutex);
 
             if (peer_exists(&new_peer)) {
@@ -436,14 +491,161 @@ void* handle_server_request_thread(void *vargp)
             }
 
             pthread_mutex_unlock(&network_mutex);
+            
+        }
+    } else if (header.command == COMMAND_INFORM) { // Handle INFORM requests
+
+    if (header.length != PEER_ADDR_LEN) { // Invalid INFORM request length
+        status = STATUS_MALFORMED;
+    }
+    else { // Valid INFORM request
+        Address_t received_peer;
+        memcpy(&received_peer, body, PEER_ADDR_LEN);
+
+        // Convert the received port to host byte order.
+        received_peer.port = ntohl(received_peer.port);
+
+        // Validate the received peer.
+        if (memchr(received_peer.ip, '\0', IP_LEN) == NULL ||
+            !is_valid_ip(received_peer.ip) ||
+            !is_valid_port(received_peer.port)) {
+            status = STATUS_MALFORMED;
+        }
+        else { // Valid INFORM request
+            Address_t *peer_ptr = malloc(sizeof(Address_t));
+
+            if (peer_ptr == NULL) {
+                status = STATUS_OTHER;
+            }
+            else { // Allocate memory for the new peer and copy the received peer data
+                memcpy(peer_ptr, &received_peer, sizeof(Address_t));
+
+                pthread_mutex_lock(&network_mutex);
+
+                if (peer_exists(peer_ptr)) {
+                    free(peer_ptr);
+                    status = STATUS_OK;
+                }
+                else {
+                    Address_t **new_network = realloc(
+                        network, (peer_count + 1) * sizeof(Address_t *)
+                    );
+
+                    if (new_network == NULL) {
+                        free(peer_ptr);
+                        status = STATUS_OTHER;
+                    }
+                    else {
+                        network = new_network;
+                        network[peer_count] = peer_ptr;
+                        peer_count++;
+                        status = STATUS_OK;
+
+                        printf("Added peer through INFORM: %s:%u\n",
+                            peer_ptr->ip, peer_ptr->port);
+                    }
+                }
+
+                pthread_mutex_unlock(&network_mutex);
+            }
+        }
+    }
+} else if (header.command == COMMAND_RETREIVE) {
+    if (header.length == 0) {
+        status = STATUS_MALFORMED;
+    }
+    else {
+        FILE *file = fopen(body, "rb");
+
+        if (file == NULL) {
+            status = STATUS_OTHER;
+        }
+        else { // Valid RETRIEVE request
+            fseek(file, 0, SEEK_END);
+            long file_size = ftell(file);
+            rewind(file);
+
+            reply_body = malloc(file_size);
+
+            if (reply_body == NULL) {
+                fclose(file);
+                status = STATUS_OTHER;
+            }
+            else { // Valid RETRIEVE request
+                size_t bytes_read = fread(reply_body, 1, file_size, file);
+
+                if (bytes_read != file_size) {
+                    free(reply_body);
+                    reply_body = NULL;
+                    status = STATUS_OTHER;
+                }
+                else {
+                    reply_length = file_size;
+                    status = STATUS_OK;
+                }
+            }
+
+            fclose(file);
+        }
+    }
+}
+
+
+// 8. Inform all existing peers about the new peer
+    if (header.command == COMMAND_REGISTER && status == STATUS_OK) { // Handle new peer registration
+    pthread_mutex_lock(&network_mutex);
+
+    Address_t *peers_to_inform = malloc(peer_count * sizeof(Address_t));
+    uint32_t inform_count = 0;
+
+    if (peers_to_inform != NULL) { // Check if memory allocation was successful
+        for (uint32_t i = 0; i < peer_count; i++) {
+
+            // Skip ourselves
+            if (strcmp(network[i]->ip, my_address->ip) == 0 &&
+                network[i]->port == my_address->port) {
+                continue;
+            }
+
+            // Skip the newly registered peer
+            if (strcmp(network[i]->ip, new_peer.ip) == 0 &&
+                network[i]->port == new_peer.port) {
+                continue;
+            }
+
+            // Skip peers without a signature or salt
+            hashdata_t empty_signature = {0};
+            char empty_salt[SALT_LEN] = {0};
+
+            if (memcmp(network[i]->signature, empty_signature,
+                       sizeof(empty_signature)) == 0 ||
+                memcmp(network[i]->salt, empty_salt, SALT_LEN) == 0) {
+                continue;
+            }
+
+            peers_to_inform[inform_count] = *network[i]; // Copy peer information
+            inform_count++;
         }
     }
 
-    // Generate a reply containin the current network.
-    uint32_t reply_length = 0;
-    char *reply_body = NULL;
+    pthread_mutex_unlock(&network_mutex); 
 
-    if (status == STATUS_OK) {
+    if (peers_to_inform != NULL) { // Check if memory allocation was successful
+        // Convert the new peer's port to network byte order
+        Address_t inform_peer = new_peer;
+        inform_peer.port = htonl(inform_peer.port);
+
+        // Send INFORM to all existing peers
+        for (uint32_t i = 0; i < inform_count; i++) {
+            send_message(peers_to_inform[i], COMMAND_INFORM,
+                         (char *)&inform_peer, PEER_ADDR_LEN);
+        }
+
+        free(peers_to_inform);
+    }
+}
+
+    if (status == STATUS_OK && header.command == COMMAND_REGISTER) { // Handle new peer registration
         pthread_mutex_lock(&network_mutex);
 
         reply_length = peer_count * PEER_ADDR_LEN;
@@ -473,8 +675,35 @@ void* handle_server_request_thread(void *vargp)
 
         pthread_mutex_unlock(&network_mutex);
     }
-    
-    send_response(connfd, status, reply_body, reply_length);
+
+    if (header.command != COMMAND_INFORM) { // Not an INFORM request
+    if (status != STATUS_OK) {
+        const char *error_message;
+
+        switch (status) { // Handle different error statuses
+            case STATUS_BAD_REQUEST:
+                error_message = "Bad request";
+                break;
+            case STATUS_MALFORMED:
+                error_message = "Malformed request";
+                break;
+            case STATUS_PEER_EXISTS:
+                error_message = "Peer already exists";
+                break;
+            case STATUS_OTHER:
+                error_message = "Internal server error";
+                break;
+            default:
+                error_message = "Unknown error";
+                break;
+        }
+
+        send_error_response(connfd, status, error_message);
+    }
+    else {
+        send_response(connfd, status, reply_body, reply_length);
+    }
+}
 
     free(reply_body);
     free(body);
@@ -495,6 +724,10 @@ void* server_thread()
     port_char[5] = '\0';
     sprintf(port_char, "%d", my_address->port);
     listenfd = compsys_helper_open_listenfd(port_char);
+    if (listenfd < 0) {
+        perror("open_listenfd");
+        return NULL;
+}
     
     printf("Starting to listen on %s:%d\n", my_address->ip, my_address->port);
     
