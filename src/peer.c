@@ -52,23 +52,39 @@ int peer_exists(const Address_t* peer) {
 }
 
 // Build a reply header and send it, followed by the body if there is one.
+// 14. Multi-block responses
 void send_response(int connfd, uint32_t status, char* body, uint32_t length) {
+    uint32_t max_block_size = MAX_MSG_LEN - REPLY_HEADER_LEN; // 8116 bytes
+    uint32_t block_count = (length + max_block_size - 1) / max_block_size; // how many blocks the file should be divided in
+    if (block_count == 0) {
+        block_count = 1;
+    }
     ReplyHeader_t reply_header;
     memset(&reply_header, 0, sizeof(ReplyHeader_t));
-    reply_header.length = htonl(length);
     reply_header.status = htonl(status);
-    reply_header.this_block = htonl(0);
-    reply_header.block_count = htonl(1);
-
-    char empty_body[1] = {0};
-
-    get_data_sha(body != NULL ? body : empty_body, reply_header.block_hash, length, SHA256_HASH_SIZE);
+    reply_header.block_count = htonl(block_count);
     
-    memcpy(reply_header.total_hash, reply_header.block_hash, SHA256_HASH_SIZE);
+    char empty_body[1] = {0};
+    hashdata_t total_hash;
+    get_data_sha(body != NULL ? body : empty_body, total_hash, length, SHA256_HASH_SIZE);
+    memcpy(reply_header.total_hash, total_hash, SHA256_HASH_SIZE);
 
-    compsys_helper_writen(connfd, &reply_header, REPLY_HEADER_LEN);
-    if (length > 0 && body != NULL) {
-        compsys_helper_writen(connfd, body, length);
+    // Compute the hash for each block
+    for (uint32_t i = 0; i < block_count; i++) { // Iterate over each block
+        uint32_t offset = i * max_block_size;
+        uint32_t block_length = length - offset;
+
+        if (block_length > max_block_size) {
+            block_length = max_block_size;
+        }
+        reply_header.length = htonl(block_length);
+        reply_header.this_block = htonl(i);
+        get_data_sha(body != NULL ? body + offset : empty_body, reply_header.block_hash, block_length, SHA256_HASH_SIZE);
+        compsys_helper_writen(connfd, &reply_header, REPLY_HEADER_LEN);
+
+        if (block_length > 0 && body != NULL) {
+            compsys_helper_writen(connfd, body + offset, block_length); 
+        }
     }
 }
 // 11. Send an error response back to the client
@@ -352,6 +368,7 @@ void* client_thread()
 
     return NULL;
 }
+
 
 
 /*
