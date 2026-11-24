@@ -51,6 +51,7 @@ int peer_exists(const Address_t* peer) {
     return 0;
 }
 
+
 // Build a reply header and send it, followed by the body if there is one.
 // 14. Multi-block responses
 void send_response(int connfd, uint32_t status, char* body, uint32_t length) {
@@ -137,6 +138,7 @@ void send_message(Address_t peer_address, int command,
     }
     
 
+    
     /*
     3: Handing the response to the register message
     Rather than closing immediately we should probably handle a response.
